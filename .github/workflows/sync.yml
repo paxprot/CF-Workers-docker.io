@@ -1,11 +1,11 @@
-name: Upstream Sync
+name: Upstream Sync and Deploy to Workers
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "0 0 * * *" # every day
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
@@ -14,12 +14,16 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.repository.fork }}
 
+    outputs:
+      has_new_commits: ${{ steps.sync.outputs.has_new_commits }}
+      worker_changed: ${{ steps.check_worker.outputs.worker_changed }}
+
     steps:
-      # Step 1: run a standard checkout action
       - name: Checkout target repo
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
-      # Step 2: run the sync action
       - name: Sync upstream changes
         id: sync
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
@@ -27,14 +31,96 @@ jobs:
           upstream_sync_repo: cmliu/CF-Workers-docker.io
           upstream_sync_branch: main
           target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
-
-          # Set test_mode true to run tests instead of the true action!!
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
           test_mode: false
 
-      - name: Sync check
-        if: failure()
+      - name: Fail if sync step failed
+        if: steps.sync.outcome == 'failure'
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，你需要手动 Sync Fork 一次，详细教程请查看项目README.md "
-          echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork. Please refer to the project README.md for instructions. "
+          echo "[Error] Sync failed due to upstream changes or conflicts."
           exit 1
+
+      - name: Check if _worker.js changed
+        id: check_worker
+        if: steps.sync.outputs.has_new_commits == 'true'
+        run: |
+          git fetch origin main
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || true)
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          if echo "$CHANGED_FILES" | grep -q "^_worker.js$"; then
+            echo "worker_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "worker_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy_to_cloudflare:
+    name: Deploy to Cloudflare Workers
+    runs-on: ubuntu-latest
+    needs: sync_latest_from_upstream
+    if: needs.sync_latest_from_upstream.outputs.has_new_commits == 'true' && needs.sync_latest_from_upstream.outputs.worker_changed == 'true'
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  notify_failure:
+    name: Notify on Failure via Telegram
+    runs-on: ubuntu-latest
+    if: failure()
+    needs:
+      - sync_latest_from_upstream
+      - deploy_to_cloudflare
+
+    steps:
+      - name: Send Telegram Failure Notification
+        run: |
+          MESSAGE="<b>❌ GitHub Action Failed: Upstream Sync and Deploy to Workers</b>\n"
+          MESSAGE+="Repository: <b>${{ github.repository }}</b>\n"
+
+          if [[ "${{ needs.sync_latest_from_upstream.result }}" == "failure" ]]; then
+            MESSAGE+="• Job <b>sync_latest_from_upstream</b> failed.\n"
+          fi
+
+          if [[ "${{ needs.deploy_to_cloudflare.result }}" == "failure" ]]; then
+            MESSAGE+="• Job <b>deploy_to_cloudflare</b> failed.\n"
+          fi
+
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\", \"text\": \"$MESSAGE\", \"parse_mode\": \"HTML\"}"
+
+  notify_success:
+    name: Notify on Success via Telegram
+    runs-on: ubuntu-latest
+    # only run if upstream actually had changes
+    if: needs.sync_latest_from_upstream.outputs.has_new_commits == 'true' && success()
+    needs:
+      - sync_latest_from_upstream
+      - deploy_to_cloudflare
+
+    steps:
+      - name: Send Telegram Success Notification
+        run: |
+          MESSAGE="<b>✅ GitHub Action Succeeded: Upstream Sync and Deploy to Workers</b>\n"
+          MESSAGE+="Repository: <b>${{ github.repository }}</b>\n"
+
+          if [[ "${{ needs.sync_latest_from_upstream.outputs.worker_changed }}" == "false" ]]; then
+            MESSAGE+="• Upstream changes detected.\n"
+            MESSAGE+="• _worker.js was unchanged. No deployment triggered.\n"
+          else
+            MESSAGE+="• Upstream changes detected.\n"
+            MESSAGE+="• _worker.js changed. Deployment triggered and succeeded.\n"
+          fi
+
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\", \"text\": \"$MESSAGE\", \"parse_mode\": \"HTML\"}"
